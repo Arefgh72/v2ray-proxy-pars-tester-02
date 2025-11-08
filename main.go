@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -366,6 +365,7 @@ func testSingleProxy(xrayPath, proxyLink string, localPort int) (HealthyProxy, e
 	defer os.Remove(configFile.Name())
 
 	if _, err := configFile.Write(configJSON); err != nil {
+		configFile.Close() // Close file before returning
 		return HealthyProxy{}, err
 	}
 	configFile.Close()
@@ -373,12 +373,17 @@ func testSingleProxy(xrayPath, proxyLink string, localPort int) (HealthyProxy, e
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout+2*time.Second)
 	defer cancel()
 
-	// ---- FIX: Use "./xray" to specify the executable in the current directory ----
 	cmd := exec.CommandContext(ctx, "./"+xrayPath, "-c", configFile.Name())
+	// IMPORTANT: Discard stdout and stderr to prevent the process from blocking
+	// when the OS buffer fills up. This is a common cause of deadlocks.
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
 	if err := cmd.Start(); err != nil {
 		return HealthyProxy{}, err
 	}
 
+	// Give xray a moment to initialize the local SOCKS server
 	time.Sleep(500 * time.Millisecond)
 
 	httpClient := &http.Client{
@@ -390,7 +395,11 @@ func testSingleProxy(xrayPath, proxyLink string, localPort int) (HealthyProxy, e
 	resp, err := httpClient.Get(testURL)
 	latency := time.Since(start)
 
-	cmd.Process.Kill()
+	// Ensure the process is terminated and resources are cleaned up.
+	if cmd.Process != nil {
+		cmd.Process.Kill()
+	}
+	cmd.Wait() // Wait to release process resources.
 
 	if err != nil {
 		return HealthyProxy{}, fmt.Errorf("test failed: %w", err)
@@ -404,13 +413,17 @@ func testSingleProxy(xrayPath, proxyLink string, localPort int) (HealthyProxy, e
 	return HealthyProxy{Link: proxyLink, Latency: latency, Type: protocol}, nil
 }
 
+// TestUpdate is used to send progress updates from workers to the reporter.
+type TestUpdate struct {
+	IsHealthy bool
+}
+
 func testProxies(proxies []string, xrayPath string) []HealthyProxy {
 	totalProxies := len(proxies)
 	fmt.Printf("\n--- Starting to test %d proxies with %d concurrent workers... ---\n", totalProxies, maxConcurrentTests)
 
 	var healthyProxies []HealthyProxy
-	var wg sync.WaitGroup
-	var testedCount, healthyCount atomic.Int64
+	var workerWg sync.WaitGroup
 
 	proxyChan := make(chan string, totalProxies)
 	for _, p := range proxies {
@@ -418,43 +431,83 @@ func testProxies(proxies []string, xrayPath string) []HealthyProxy {
 	}
 	close(proxyChan)
 
-	resultsChan := make(chan HealthyProxy, totalProxies)
+	// A channel for workers to report success or failure.
+	progressChan := make(chan TestUpdate, totalProxies)
+	// A separate channel to collect only the healthy proxies.
+	healthyChan := make(chan HealthyProxy, totalProxies)
 
+	// --- Dedicated Progress Reporter Goroutine ---
+	// This goroutine is the ONLY one that prints to the console, preventing race conditions.
+	var reporterWg sync.WaitGroup
+	reporterWg.Add(1)
+	go func() {
+		defer reporterWg.Done()
+		var testedCount, healthyCount int64
+		startTime := time.Now()
+
+		for update := range progressChan {
+			testedCount++
+			if update.IsHealthy {
+				healthyCount++
+			}
+
+			// Calculate progress and ETA
+			elapsed := time.Since(startTime).Seconds()
+			speed := float64(testedCount) / elapsed
+			eta := 0.0
+			if speed > 0 {
+				eta = float64(totalProxies-int(testedCount)) / speed
+			}
+			healthyPercentage := 0.0
+			if testedCount > 0 {
+				healthyPercentage = float64(healthyCount) * 100 / float64(testedCount)
+			}
+
+			// Print on a single line
+			fmt.Printf(
+				"\rTesting... [%d/%d] | Healthy: %d (%.2f%%) | Speed: %.2f p/s | ETA: %.0fs ",
+				testedCount,
+				totalProxies,
+				healthyCount,
+				healthyPercentage,
+				speed,
+				eta,
+			)
+		}
+	}()
+
+	// --- Worker Goroutines ---
 	for i := 0; i < maxConcurrentTests; i++ {
-		wg.Add(1)
+		workerWg.Add(1)
 		go func(workerID int) {
-			defer wg.Done()
+			defer workerWg.Done()
 			localPort := 1080 + workerID
 			for proxyLink := range proxyChan {
 				result, err := testSingleProxy(xrayPath, proxyLink, localPort)
-
-				currentCount := testedCount.Add(1)
-				var currentHealthy int64
-
 				if err == nil {
-					currentHealthy = healthyCount.Add(1)
-					resultsChan <- result
+					progressChan <- TestUpdate{IsHealthy: true}
+					healthyChan <- result
 				} else {
-					currentHealthy = healthyCount.Load()
-				}
-
-				// Update progress every 10 proxies or on the last one
-				if currentCount%10 == 0 || currentCount == int64(totalProxies) {
-					healthyPercentage := float64(currentHealthy) * 100 / float64(currentCount)
-					fmt.Printf("\rTesting... [%d/%d] | Healthy: %d (%.2f%%)", currentCount, totalProxies, currentHealthy, healthyPercentage)
+					progressChan <- TestUpdate{IsHealthy: false}
 				}
 			}
 		}(i)
 	}
 
+	// Wait for all workers to finish, then close the channels.
 	go func() {
-		wg.Wait()
-		close(resultsChan)
+		workerWg.Wait()
+		close(progressChan)
+		close(healthyChan)
 	}()
 
-	for result := range resultsChan {
+	// Collect all healthy proxies from the healthyChan.
+	for result := range healthyChan {
 		healthyProxies = append(healthyProxies, result)
 	}
+
+	// Wait for the reporter to finish printing the final status.
+	reporterWg.Wait()
 
 	fmt.Println("\nTesting complete.")
 	return healthyProxies
