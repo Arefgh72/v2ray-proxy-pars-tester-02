@@ -24,7 +24,6 @@ import (
 
 const (
 	proxyListURL       = "https://raw.githubusercontent.com/Arefgh72/vray-proxy-pars-tester/main/output/github_all.txt"
- refactor-update-proxy-fetcher
 
 	testURL            = "https://aistudio.google.com/"
 	requestTimeout     = 12 * time.Second
