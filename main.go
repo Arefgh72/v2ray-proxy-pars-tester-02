@@ -23,7 +23,7 @@ import (
 
 const (
 	proxyListURL       = "https://raw.githubusercontent.com/Arefgh72/vray-proxy-pars-tester/main/output/github_all.txt"
-	testURL            = "https://aistudio.google.com/"
+	testURL            = "https://www.youtube.com/"
 	requestTimeout     = 12 * time.Second
 	xrayRepoAPI        = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 	xrayExecutable     = "xray"
