@@ -12413,3 +12413,12 @@ Healthy proxies by type:
 - Vmess: 46
 --- Cycle End ---
 
+--- Cycle Start: 2026-03-13T10:46:06Z ---
+Total proxies tested: 17510
+Total healthy proxies: 5039
+
+Healthy proxies by type:
+- Ss: 4992
+- Vmess: 47
+--- Cycle End ---
+
